@@ -1,0 +1,280 @@
+# Central deployment pipeline for Campus Motion projects.
+#
+# Projects do not copy this file. They call it from a small workflow
+# (see templates/deploy.yml), so every project deploys the same way:
+#
+#   push to main        -> build the image, deploy to staging (EPFL intranet VM)
+#   push to production  -> deploy to production (maintainers and admins only)
+#   "Run workflow"      -> promote main to production, or roll back an environment
+#
+# Images are tagged with the full commit SHA, so production runs the image that
+# was tested on staging. Projects that bake settings into the build (such as a
+# Vite VITE_API_URL) get one image per environment, tagged <sha>-<environment>.
+
+name: Campus Motion pipeline
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: Site name on the VMs, as given to server/add-site.sh.
+        type: string
+        required: true
+      action:
+        description: push, promote-to-production, rollback-staging or rollback-production.
+        type: string
+        default: push
+      version:
+        description: For a rollback, the commit to go back to (7 to 40 characters of its SHA).
+        type: string
+        default: ""
+      context:
+        description: Docker build context, relative to the repository root.
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repository root.
+        type: string
+        default: Dockerfile
+      staging-build-args:
+        description: Docker build arguments for staging, one NAME=value per line. Public values only.
+        type: string
+        default: ""
+      production-build-args:
+        description: Docker build arguments for production, one NAME=value per line. Public values only.
+        type: string
+        default: ""
+      staging-url:
+        description: URL checked after a staging deploy. Leave empty to skip the check.
+        type: string
+        default: ""
+      production-url:
+        description: URL checked after a production deploy. Leave empty to skip the check.
+        type: string
+        default: ""
+    secrets:
+      PRODUCTION_SSH_KEY:
+        description: Private SSH key of the github-deploy user on the production VM.
+        required: true
+
+jobs:
+  plan:
+    name: Decide what to deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      environment: ${{ steps.plan.outputs.environment }}
+      sha: ${{ steps.plan.outputs.sha }}
+      promote: ${{ steps.plan.outputs.promote }}
+    steps:
+      - id: plan
+        env:
+          ACTION: ${{ inputs.action }}
+          VERSION: ${{ inputs.version }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.triggering_actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          promote=false
+          case "$ACTION" in
+            push)
+              case "$REF" in
+                main) environment=staging ;;
+                production) environment=production ;;
+                *) fail "Branch '$REF' is not deployed. Only main (staging) and production are." ;;
+              esac
+              sha=$SHA ;;
+            promote-to-production)
+              environment=production
+              promote=true
+              sha=$(gh api "repos/$REPO/commits/main" --jq .sha) ;;
+            rollback-staging|rollback-production)
+              environment=${ACTION#rollback-}
+              [[ "$VERSION" =~ ^[0-9a-f]{7,40}$ ]] || fail "For a rollback, give the commit to go back to (at least 7 characters of its SHA)."
+              sha=$(gh api "repos/$REPO/commits/$VERSION" --jq .sha) || fail "Commit '$VERSION' was not found in $REPO." ;;
+            *)
+              fail "Unknown action '$ACTION'." ;;
+          esac
+
+          # GitHub Free has no branch protection on private repositories, so the
+          # production gate is a role check that works on every plan.
+          if [[ "$environment" == production ]]; then
+            role=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .role_name)
+            [[ "$role" == admin || "$role" == maintain ]] \
+              || fail "$ACTOR has the '$role' role on $REPO. Only maintainers and admins can change production."
+          fi
+
+          {
+            echo "environment=$environment"
+            echo "sha=$sha"
+            echo "promote=$promote"
+          } >> "$GITHUB_OUTPUT"
+          echo "Plan: $ACTION -> $environment at ${sha:0:7}" >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    name: Build the image if needed
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.name.outputs.tag }}
+    steps:
+      - id: name
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          BUILD_ARGS: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || inputs.staging-build-args }}
+        run: |
+          # One image for both environments, unless this environment has its own build arguments.
+          tag=$SHA
+          [[ -n "$BUILD_ARGS" ]] && tag="$SHA-$ENVIRONMENT"
+          {
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: check
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "Image $IMAGE already exists, reusing it."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+
+      - if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          build-args: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || inputs.staging-build-args }}
+          push: true
+          tags: ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  promote:
+    name: Move production to main
+    needs: [plan, image]
+    if: needs.plan.outputs.promote == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+
+      # A fast-forward keeps the exact commit tested on staging. A push made with
+      # the workflow token does not start another workflow, so the deploy job
+      # below handles production itself.
+      - env:
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          if ! git push origin "$SHA:refs/heads/production"; then
+            echo "::error::production has commits that are not on main (for example a hotfix). Merge production into main, then promote again."
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy to ${{ needs.plan.outputs.environment }}
+    needs: [plan, image, promote]
+    if: >-
+      always()
+      && needs.plan.result == 'success'
+      && needs.image.result == 'success'
+      && (needs.promote.result == 'success' || needs.promote.result == 'skipped')
+    # Staging is on the EPFL intranet, which GitHub cannot reach: a runner on
+    # that VM picks the job up. Production is reached over SSH.
+    runs-on: ${{ needs.plan.outputs.environment == 'staging' && fromJSON('["self-hosted", "campus-motion-staging"]') || 'ubuntu-latest' }}
+    environment:
+      name: ${{ needs.plan.outputs.environment }}
+      url: ${{ needs.plan.outputs.environment == 'production' && inputs.production-url || inputs.staging-url }}
+    concurrency:
+      group: deploy-${{ inputs.site }}-${{ needs.plan.outputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      packages: read
+    steps:
+      # The workflow token goes to cm-deploy on stdin, so the VM can pull the
+      # image without storing any registry password. It expires with this run.
+      - name: Deploy on the staging VM
+        if: needs.plan.outputs.environment == 'staging'
+        env:
+          SITE: ${{ inputs.site }}
+          TAG: ${{ needs.image.outputs.tag }}
+          TOKEN: ${{ github.token }}
+        run: printf '%s' "$TOKEN" | sudo -n -u github-deploy /usr/local/bin/cm-deploy "$SITE" staging "$TAG"
+
+      - name: Deploy on the production VM
+        if: needs.plan.outputs.environment == 'production'
+        env:
+          SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          HOST: ${{ vars.PRODUCTION_HOST }}
+          KNOWN_HOSTS: ${{ vars.PRODUCTION_KNOWN_HOSTS }}
+          SITE: ${{ inputs.site }}
+          TAG: ${{ needs.image.outputs.tag }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SSH_KEY" || -z "$HOST" || -z "$KNOWN_HOSTS" ]]; then
+            echo "::error::PRODUCTION_SSH_KEY, PRODUCTION_HOST or PRODUCTION_KNOWN_HOSTS is missing. See the README of Campus-Motion/deploy."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s' "$TOKEN" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "github-deploy@$HOST" "$SITE production $TAG"
+
+      - name: Check that the site answers
+        if: (needs.plan.outputs.environment == 'production' && inputs.production-url != '') || (needs.plan.outputs.environment == 'staging' && inputs.staging-url != '')
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+          URL: ${{ needs.plan.outputs.environment == 'production' && inputs.production-url || inputs.staging-url }}
+        run: |
+          # Staging may use a certificate from Caddy's own authority, which this
+          # check cannot verify. Production certificates are always verified.
+          insecure=()
+          [[ "$ENVIRONMENT" == staging ]] && insecure=(--insecure)
+          curl "${insecure[@]}" --fail --silent --show-error --output /dev/null \
+            --retry 10 --retry-delay 6 --retry-all-errors --max-time 10 "$URL" \
+            || { echo "::error::$URL does not answer after the deploy. Roll back if the site is broken."; exit 1; }
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          {
+            echo "Deployed **${SHA:0:7}** to **$ENVIRONMENT**."
+            echo
+            echo "To undo, run this workflow with a rollback and the commit of the previous deploy."
+          } >> "$GITHUB_STEP_SUMMARY"

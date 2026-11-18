@@ -1,0 +1,45 @@
+# Copy this file to .github/workflows/deploy.yml in your project,
+# then change the lines marked CHANGE.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main, production]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        options:
+          - promote-to-production
+          - rollback-production
+          - rollback-staging
+      version:
+        description: For a rollback only, the commit to go back to (at least 7 characters of its SHA)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  pipeline:
+    uses: Campus-Motion/deploy/.github/workflows/pipeline.yml@v1
+    with:
+      site: my-site                               # CHANGE: the site name given to add-site.sh
+      action: ${{ inputs.action || 'push' }}
+      version: ${{ inputs.version }}
+      staging-url: https://staging.example.ch     # CHANGE, or delete the line to skip the check
+      production-url: https://example.ch          # CHANGE, or delete the line to skip the check
+      # If the Dockerfile is not at the repository root:
+      # context: api
+      # dockerfile: api/Dockerfile
+      # If the build needs different settings per environment (public values only,
+      # secrets go in app.env on the VM):
+      # staging-build-args: |
+      #   VITE_API_URL=https://staging-api.example.ch
+      # production-build-args: |
+      #   VITE_API_URL=https://api.example.ch
+    secrets: inherit

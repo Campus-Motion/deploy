@@ -1,0 +1,12 @@
+# Created by add-site.sh. The pipeline only changes IMAGE_TAG (kept in .env).
+# Admins can add services here, such as a database (see the README).
+name: @PROJECT@
+
+services:
+  app:
+    image: @IMAGE@:${IMAGE_TAG:?no version deployed yet}
+    env_file: app.env
+    ports:
+      # Only reachable through Caddy, never directly from the internet.
+      - "127.0.0.1:@HOST_PORT@:@CONTAINER_PORT@"
+    restart: unless-stopped

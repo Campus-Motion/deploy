@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Runs on a VM for every deploy, as the github-deploy user. It is the only
+# thing the pipeline can do on a VM (see install.sh):
+#   production: forced command of the SSH key, arguments in SSH_ORIGINAL_COMMAND
+#   staging:    run by the GitHub runner through sudo, arguments on the command line
+#
+# Arguments: <site> <environment> <image tag>
+# Stdin:     a short-lived registry token from the workflow run
+set -euo pipefail
+
+SITES_DIR=/srv/sites
+fail() { echo "cm-deploy: $*" >&2; exit 1; }
+
+if [[ $# -gt 0 ]]; then
+  [[ $# -eq 3 ]] || fail "expected 3 arguments"
+  site=$1 environment=$2 tag=$3
+else
+  read -r site environment tag extra <<< "${SSH_ORIGINAL_COMMAND:-}"
+  [[ -z "${extra:-}" ]] || fail "too many arguments"
+fi
+
+[[ "${site:-}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || fail "invalid site name"
+[[ "${environment:-}" == staging || "${environment:-}" == production ]] || fail "environment must be staging or production"
+[[ "${tag:-}" =~ ^[0-9a-f]{40}(-staging|-production)?$ ]] || fail "invalid image tag"
+[[ "$tag" != *-* || "$tag" == *"-$environment" ]] || fail "image tag $tag is not for $environment"
+
+# Each VM hosts one environment, recorded by install.sh.
+vm_environment=$(cat /etc/campus-motion/environment 2> /dev/null || true)
+[[ "$environment" == "$vm_environment" ]] || fail "this VM hosts '${vm_environment:-nothing}', not $environment"
+
+dir="$SITES_DIR/$site"
+[[ -f "$dir/docker-compose.yml" ]] || fail "unknown site '$site' (an admin must run add-site.sh on this VM first)"
+
+token=$(head -c 2048)
+[[ -n "$token" ]] || fail "missing registry token on stdin"
+
+# Log in to the registry for this deploy only, in a throwaway config.
+DOCKER_CONFIG=$(mktemp -d)
+export DOCKER_CONFIG
+trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+printf '%s' "$token" | docker login ghcr.io --username github-deploy --password-stdin > /dev/null
+
+cd "$dir"
+previous=$(sed -n 's/^IMAGE_TAG=//p' .env 2> /dev/null || true)
+
+export IMAGE_TAG="$tag"
+docker compose pull --quiet
+docker compose up -d --remove-orphans
+
+# .env keeps the running version, so a plain "docker compose up -d" by an admin
+# restarts the same version.
+echo "IMAGE_TAG=$tag" > .env
+printf '%s %s -> %s\n' "$(date -u +%FT%TZ)" "${previous:-none}" "$tag" >> deploy.log
+
+# Keep a month of unused images so recent rollbacks start instantly.
+docker image prune -af --filter "until=720h" > /dev/null
+
+echo "Deployed $site to $environment at ${tag:0:7} (previous: ${previous:0:7})"
