@@ -42,4 +42,5 @@ jobs:
       #   VITE_API_URL=https://staging-api.example.ch
       # production-build-args: |
       #   VITE_API_URL=https://api.example.ch
-    secrets: inherit
+    secrets:
+      PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}

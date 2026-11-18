@@ -55,7 +55,7 @@ on:
     secrets:
       PRODUCTION_SSH_KEY:
         description: Private SSH key of the github-deploy user on the production VM.
-        required: true
+        required: false # staging runs must start before production is set up
 
 jobs:
   plan:
