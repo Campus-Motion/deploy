@@ -55,7 +55,7 @@ on:
     secrets:
       PRODUCTION_SSH_KEY:
         description: Private SSH key of the github-deploy user on the production VM.
-        required: true
+        required: false # staging runs must start before production is set up
 
 jobs:
   plan:
@@ -131,7 +131,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ needs.plan.outputs.environment }}
           SHA: ${{ needs.plan.outputs.sha }}
-          BUILD_ARGS: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || inputs.staging-build-args }}
+          BUILD_ARGS: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || needs.plan.outputs.environment == 'staging' && inputs.staging-build-args || '' }}
         run: |
           # One image for both environments, unless this environment has its own build arguments.
           tag=$SHA
@@ -171,7 +171,7 @@ jobs:
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
-          build-args: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || inputs.staging-build-args }}
+          build-args: ${{ needs.plan.outputs.environment == 'production' && inputs.production-build-args || needs.plan.outputs.environment == 'staging' && inputs.staging-build-args || '' }}
           push: true
           tags: ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
