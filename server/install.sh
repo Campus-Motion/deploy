@@ -64,5 +64,5 @@ systemctl reload caddy
 if [[ "$environment" == production ]]; then
   echo "Done. Set PRODUCTION_HOST and PRODUCTION_KNOWN_HOSTS in GitHub (see README), then add sites with add-site.sh."
 else
-  echo "Done. Register the GitHub runner as the github-runner user (see README), then add sites with add-site.sh."
+  echo "Done. Register the GitHub runner as the github-runner user, run staging-tls.sh (see README), then add sites with add-site.sh."
 fi

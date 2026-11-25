@@ -17,7 +17,7 @@ merge into main ──> image built and tagged with the commit ──> staging V
 | VM | EPFL intranet VM, reachable only from the EPFL network or VPN | Public VM |
 | Addresses | `<site>.staging.campusmotion.ch` | `<site>.campusmotion.ch` or the project's own domain |
 | How GitHub deploys | A GitHub runner installed on the VM picks the job up | Over SSH, with a key that can only run `cm-deploy` |
-| HTTPS certificate | Caddy's own (`tls internal`): browsers show a warning | Automatic (Let's Encrypt) |
+| HTTPS certificate | Let's Encrypt, checked through DNS (`staging-tls.sh`) | Automatic (Let's Encrypt) |
 
 This repository is public on purpose: it holds no secrets and no server addresses, and public reusable workflows work for both public and private repositories.
 
@@ -47,7 +47,7 @@ You need an admin who can log into both VMs for steps 2 and 3.
 1. **Dockerfile.** The project must build with Docker. Start from an existing project if you are unsure.
 2. **On each VM** (staging, then production): go to this repository's `server` folder on the VM (`git clone` it the first time, `git pull` after) and run `sudo ./add-site.sh`. Give the **same site name** on both VMs. It asks for the GitHub repository, the port the app uses inside its container, the domain, and the certificate type (keep the default).
 3. **Settings and secrets:** fill in `/srv/sites/<site>/app.env` on each VM. Use **different** values on each: staging must never use the production database or production keys.
-4. **DNS:** staging names under `staging.campusmotion.ch` already work (see one-time setup). For production, add an `A` record for the domain pointing to the production VM.
+4. **DNS** at Hostinger: `add-site.sh` prints the records to add. For staging, an `A` record for `<site>.staging` pointing to the staging VM, and a `CNAME` for `_acme-challenge.<site>.staging` for its certificate. For production, an `A` record for the domain pointing to the production VM.
 5. **In the project repository:** copy [templates/deploy.yml](templates/deploy.yml) to `.github/workflows/deploy.yml` and change the lines marked `CHANGE`. If the build needs a setting such as an API address, use `staging-build-args` and `production-build-args`. Only public values go there: they end up inside the image. Secrets go in `app.env`.
 6. **First deploy:** merge the pull request that adds `deploy.yml` into `main`. To create the `production` branch the first time, run `promote-to-production`.
 
@@ -127,11 +127,17 @@ Done once for the whole organisation. Redo the step for a VM only if that VM is 
 
    In Settings > Actions > Runner groups, the group must allow **public repositories**, since several projects are public.
 
-3. **DNS** at Hostinger, once for all projects:
+3. **Certificates.** Let's Encrypt cannot reach the intranet VM, so it checks a DNS record instead. In the `server` folder run:
 
+   ```bash
+   sudo ./staging-tls.sh
    ```
-   *.staging.campusmotion.ch   A   <staging VM address (128.178.x.x)>
-   ```
+
+   It installs a Caddy build with the `acmedns` module (kept apart from the Debian package, so `apt upgrade` does not replace it), and registers an account at [acme-dns](https://github.com/joohoi/acme-dns) (`auth.acme-dns.io`) that only this VM's address may use. The account is in `/root/acme-dns.json`, readable by root only. It can change one TXT record and nothing else: the VM never holds a key to `campusmotion.ch`.
+
+   Each staging site then needs, at Hostinger, an `A` record pointing to the VM and a `CNAME` from `_acme-challenge.<site>.staging` to the `fulldomain` of that account. `add-site.sh` prints both. Certificates renew on their own about 30 days before they expire.
+
+   If `auth.acme-dns.io` stops working, existing certificates keep working until they expire (up to 90 days). Then either run your own acme-dns, or answer `internal` in `add-site.sh` and have each person trust Caddy's root certificate in a dedicated browser profile.
 
 ### Keeping the runner safe
 
@@ -167,6 +173,7 @@ A change here reaches projects only when the `v1` tag moves.
 | `unknown site` | The `site:` in `deploy.yml` does not match a name given to `add-site.sh` on that VM. |
 | `this VM hosts 'staging', not production` | `PRODUCTION_HOST` points to the staging VM. |
 | `Host key verification failed` | The production VM was replaced or reinstalled. Update `PRODUCTION_KNOWN_HOSTS`. |
+| Staging site shows a certificate warning | Its certificate was not issued. On the staging VM: `journalctl -u caddy --since "1 hour ago" \| grep -i obtain`. `401` means the acme-dns account refused the update (wrong credentials, or the VM's address changed). Check also that the site's `_acme-challenge` CNAME exists. |
 | `does not answer after the deploy` | The app started badly. Look at its logs on the VM (`docker compose logs` in `/srv/sites/<site>`), and roll back if needed. |
 
 On each VM, `/srv/sites/<site>/deploy.log` lists every deploy with the previous and new version.
