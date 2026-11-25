@@ -27,20 +27,27 @@ container_port=$(ask "Port the app listens on inside its container" 3000)
 domain=$(ask "Domain of the $environment site (e.g. admin.example.ch)")
 [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || fail "invalid domain"
 
-# Public VMs get certificates automatically. Intranet VMs cannot, so they use
-# Caddy's own authority (browsers warn) or certificate files from EPFL IT.
+# Public VMs get certificates automatically. The intranet VM gets them through
+# DNS once staging-tls.sh has run (dns), or uses Caddy's own authority, which
+# browsers warn about (internal), or certificate files from EPFL IT.
 default_tls=auto
-[[ "$environment" == staging ]] && default_tls=internal
-tls_mode=$(ask "HTTPS certificate: auto, internal, or files" "$default_tls")
+if [[ "$environment" == staging ]]; then
+  default_tls=internal
+  grep -q '^(staging_tls)' /etc/caddy/Caddyfile 2> /dev/null && default_tls=dns
+fi
+tls_mode=$(ask "HTTPS certificate: auto, dns, internal, or files" "$default_tls")
 case "$tls_mode" in
   auto) tls_line="" ;;
+  dns)
+    grep -q '^(staging_tls)' /etc/caddy/Caddyfile 2> /dev/null || fail "run staging-tls.sh first"
+    tls_line="import staging_tls" ;;
   internal) tls_line="tls internal" ;;
   files)
     cert=$(ask "Path to the certificate file (PEM)")
     key=$(ask "Path to the private key file (PEM)")
     [[ -f "$cert" && -f "$key" ]] || fail "certificate or key file not found"
     tls_line="tls $cert $key" ;;
-  *) fail "answer auto, internal or files" ;;
+  *) fail "answer auto, dns, internal or files" ;;
 esac
 
 # Next free host port, after the ones used by existing sites.
@@ -60,6 +67,13 @@ sed -e "s|@DOMAIN@|$domain|" -e "s|@PORT@|$port|" -e "s|@TLS@|$tls_line|" \
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null
 systemctl reload caddy
 
+cname_hint=""
+if [[ "$tls_mode" == dns ]]; then
+  target=$(python3 -c "import json; print(json.load(open('/root/acme-dns.json'))['fulldomain'])" 2> /dev/null \
+    || echo "<fulldomain in /root/acme-dns.json>")
+  cname_hint=$'\n'"     For its certificate, also: _acme-challenge.${domain%.campusmotion.ch} CNAME $target"
+fi
+
 cat << EOF
 
 Site '$site' is ready on this $environment VM: https://$domain -> 127.0.0.1:$port
@@ -68,6 +82,6 @@ Next steps:
   1. Put the app's settings and secrets in $dir/app.env.
      Staging and production must use different values.
   2. If the app needs a database, add it to $dir/docker-compose.yml (see README).
-  3. Point $domain to this VM in DNS.
+  3. Point $domain to this VM in DNS (an A record).$cname_hint
   4. Run add-site.sh on the other VM with the same site name, if not done yet.
 EOF
